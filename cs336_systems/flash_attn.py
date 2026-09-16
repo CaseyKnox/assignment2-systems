@@ -27,17 +27,24 @@ class FlashAttention2(Function):
         tk = seq // bk # number of tiles in k (bk x d_model)
         sqrt_dk = q.shape[-1] ** 0.5 # sqrt(d_model)
 
-        o = torch.zeros((batch, seq, d_model)) # output tensor; shape = (batch_size, seq, d_model)
-        l = torch.zeros((batch, seq)) # logsumexp tensor; shape = (batch_size, seq)
+        o = torch.zeros((batch, seq, d_model), device=q.device) # output tensor; shape = (batch_size, seq, d_model)
+        l = torch.zeros((batch, seq), device=q.device) # logsumexp tensor; shape = (batch_size, seq)
         for i in range(tq):
             q_i = q[:, i * bq : (i + 1) * bq] # tile of q; shape = (batch, bq, d_model)
             o_i = torch.zeros_like(q_i) # output tile; shape = (batch, bq, d_model)
-            l_i = torch.zeros((batch, bq))
-            m_i = torch.ones((batch, bq)) * float("-inf")
+            l_i = torch.zeros((batch, bq), device=q.device)
+            m_i = torch.ones((batch, bq), device=q.device) * float("-inf")
 
             for j in range(tk):
                 k_j = k[:, j * bk : (j + 1) * bk] # tile of k; shape = (batch, bk, d_model)
                 s_i = torch.einsum("bqd,bkd->bqk", q_i, k_j) / sqrt_dk # shape = (batch, bq, bk)
+
+                if is_causal:
+                    q_idx = torch.arange(i * bq, (i + 1) * bq, device=q.device).unsqueeze(1)
+                    k_idx = torch.arange(j * bk, (j + 1) * bk, device=k.device).unsqueeze(0)
+                    mask = q_idx >= k_idx
+                    s_i = torch.where(mask, s_i, float("-inf"))
+
                 m_i_old = m_i.clone()
                 m_i = torch.max(m_i, s_i.max(dim=-1).values) # shape = (batch, bq)
                 p_i = torch.exp(s_i - m_i.unsqueeze(-1))  # shape = (batch, bq, bk)
@@ -54,9 +61,6 @@ class FlashAttention2(Function):
             l[:, i * bq : (i + 1) * bq] = l_i # shape = (batch, bq)
 
         ctx.save_for_backward(q, k, v, o, l)
-        print(
-            f"q.shape={q.shape}, k.shape={k.shape}, v.shape={v.shape}, o.shape={o.shape}, l.shape={l.shape}"
-        )
         return o
 
     @staticmethod
@@ -256,4 +260,39 @@ class FlashAttnTriton(Function):
             is_causal=is_causal,
         )
         ctx.save_for_backward(q, k, v, o, l)
+        ctx.is_causal = is_causal
         return o
+
+    """
+    @staticmethod
+    def backward(
+        ctx,
+        dO: torch.Tensor,
+    ):
+        q, k, v, o, l = ctx.saved_tensors
+        dQ = torch.zeros_like(q)
+        dK = torch.zeros_like(k)
+        dV = torch.zeros_like(v)
+        scale = q.shape[-1] ** 0.5
+        D = torch.sum(o * dO, dim=-1) # (batch, seq_q, d_model) -> (batch, seq_q)
+
+        S = torch.einsum("bqd,bkd->bqk", q, k) / scale # shape = (batch, seq_q, seq_k)
+        if ctx.is_causal:
+            n_queries = q.shape[1]
+            n_keys = k.shape[1]
+            # Create causal mask: query >= key
+            q_idx = torch.arange(n_queries, device=q.device).unsqueeze(1)
+            k_idx = torch.arange(n_keys, device=k.device).unsqueeze(0)
+            mask = q_idx >= k_idx
+            S = torch.where(mask, S, float('-inf'))
+        P = torch.exp(S - l.unsqueeze(-1)) # shape = (batch, seq_q, seq_k)
+        dV = torch.einsum("bqk,bqd->bkd", P, dO) # shape = (batch, seq_k, d_model)
+        dP = torch.einsum("bqd,bkd->bqk", dO, v) # (batch, seq_q, seq_k)
+        dS = (dP - D.unsqueeze(1)) * P # bqk
+        # Zero out gradients for masked positions
+        if ctx.is_causal:
+            dS = torch.where(mask, dS, 0.0)
+        dQ = torch.einsum("bqk,bkd->bqd", dS, k) / scale # shape = (batch, seq_q, d_model)
+        dK = torch.einsum("bqk,bqd->bkd", dS, q) / scale # shape = (batch, seq_k, d_model)
+        return dQ, dK, dV, None
+    """
