@@ -60,8 +60,25 @@ class FlashAttention2(Function):
         return o
 
     @staticmethod
-    def backward(ctx, grad_out: torch.Tensor):
-        raise NotImplementedError("FlashAttention2 backward is not implemented yet.")
+    def backward(
+        ctx,
+        dO: torch.Tensor,
+    ):
+        q, k, v, o, l = ctx.saved_tensors
+        dQ = torch.zeros_like(q)
+        dK = torch.zeros_like(k)
+        dV = torch.zeros_like(v)
+        scale = q.shape[-1] ** 0.5
+        D = torch.sum(o * dO, dim=-1) # (batch, seq_q, d_model) -> (batch, seq_q)
+
+        S = torch.einsum("bqd,bkd->bqk", q, k) / scale # shape = (batch, seq_q, seq_k)
+        P = torch.exp(S - l.unsqueeze(-1)) # shape = (batch, seq_q, seq_k)
+        dV = torch.einsum("bqk,bqd->bkd", P, dO) # shape = (batch, seq_k, d_model)
+        dP = torch.einsum("bqd,bkd->bqk", dO, v) # (batch, seq_q, seq_k)
+        dS = (dP - D.unsqueeze(-1)) * P # bqk
+        dQ = torch.einsum("bqk,bkd->bqd", dS, k) / scale # shape = (batch, seq_q, d_model)
+        dK = torch.einsum("bqk,bqd->bkd", dS, q) / scale # shape = (batch, seq_k, d_model)
+        return dQ, dK, dV, None
 
 
 import triton
@@ -81,6 +98,7 @@ def flash_fwd_kernel(
     D: tl.constexpr,
     Q_TILE_SIZE: tl.constexpr, # bq
     K_TILE_SIZE: tl.constexpr, # bk
+    is_causal: tl.constexpr,
 ):
     # Program indices
     query_tile_index = tl.program_id(0)
@@ -148,6 +166,14 @@ def flash_fwd_kernel(
 
         # Q @ K.t * scale
         s = tl.dot(q, tl.trans(k)) * scale # (bq, D) @ (bk, D).t -> (bq, bk)
+
+        # Apply causal mask if needed
+        if is_causal:
+            curr_query_element = query_tile_index * Q_TILE_SIZE + tl.arange(0, Q_TILE_SIZE)
+            curr_key_element = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
+            causal_mask = curr_query_element[:, None] >= curr_key_element[None, :]
+
+            s = tl.where(causal_mask, s, float('-inf'))
 
         # Mask the padded key with -inf
         offs_k = j * K_TILE_SIZE + tl.arange(0, K_TILE_SIZE)
@@ -227,6 +253,7 @@ class FlashAttnTriton(Function):
             D=d_model,
             Q_TILE_SIZE=bq,
             K_TILE_SIZE=bk,
+            is_causal=is_causal,
         )
         ctx.save_for_backward(q, k, v, o, l)
         return o
